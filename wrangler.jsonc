@@ -3,8 +3,10 @@
   "name": "agent-board",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
   "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
-  "observability": { "enabled": true },
+  // Access secrets ride in the URL path, so request logs and traces stay off. Errors still log.
+  "observability": { "enabled": true, "logs": { "invocation_logs": false }, "traces": { "enabled": false } },
   "durable_objects": {
     "bindings": [{ "name": "ROOM", "class_name": "Room" }]
   },

@@ -43,7 +43,7 @@ document.querySelectorAll("[data-copy]").forEach((b) => b.addEventListener("clic
 }));
 `;
 
-const shell = (title: string, body: string, opts: { field?: boolean } = {}) => `<!doctype html>
+const shell = (title: string, body: string, opts: { field?: boolean; fit?: boolean } = {}) => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow"><title>${esc(title)}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -101,32 +101,49 @@ const shell = (title: string, body: string, opts: { field?: boolean } = {}) => `
   details { margin-top:10px } summary { cursor:pointer; color:var(--muted); font-size:14px }
   details h3 { font:600 15px var(--body); margin:16px 0 0 }
   .fine { margin-top:40px; color:var(--muted); font-size:14px; max-width:62ch }
+  /* Landing page: everything on one screen, scaled by height as well as width. */
+  main.fit { min-height:100vh; min-height:100svh; display:flex; flex-direction:column; padding:clamp(18px,4vh,44px) 24px clamp(16px,3vh,32px) }
+  .fit .mark { margin-bottom:0 }
+  .fit .hero { flex:1; display:flex; flex-direction:column; justify-content:center; padding:clamp(16px,4vh,48px) 0 }
+  .fit h1 { font-size:min(7.4vw, 10.5vh, 108px); max-width:none; text-wrap:balance }
+  .fit .lede { margin-top:clamp(12px,2.6vh,28px); font-size:clamp(15px, min(1.5vw, 2.4vh), 19px); max-width:60ch }
+  .fit form.create { margin-top:clamp(16px,3.6vh,40px) }
+  .fit .notes { margin-top:0; gap:clamp(16px,3vw,40px); max-width:none }
+  .fit .notes h2 { font-size:clamp(15px,2.2vh,18px); margin-bottom:4px }
+  .fit .notes p { font-size:clamp(13px,1.9vh,15px); line-height:1.5 }
+  .fit .fine { margin:clamp(12px,2.4vh,24px) 0 0; font-size:13px; max-width:none }
+  .fit .fine a { color:var(--text) }
   @media (max-width:760px) {
     form.create { grid-template-columns:1fr } form.join { flex-direction:column; align-items:stretch } .notes { grid-template-columns:1fr; gap:28px }
+    .fit .notes { display:flex; flex-wrap:wrap; gap:4px 14px } .fit .notes p { display:none } .fit .notes h2 { font-size:13px; color:var(--muted) }
+    .fit form.create { grid-template-columns:1fr 1fr } .fit form.create button { grid-column:1 / -1 } .fit h1 { font-size:min(11vw, 7.5vh) } .fit .hero { padding:12px 0 }
     .steps li { padding:64px 18px 18px } .steps li::before { left:18px; top:18px } .row { flex-direction:column } .copy { align-self:flex-end }
   }
 </style></head><body>
 ${opts.field === false ? "" : '<canvas id="field" aria-hidden="true"></canvas>'}
-<main><a class="mark" href="/"><i></i>Agent Board</a>${body}</main>
+<main${opts.fit ? ' class="fit"' : ""}><a class="mark" href="/"><i></i>Agent Board</a>${body}</main>
 <script>${FIELD_SCRIPT}</script>
 </body></html>`;
 
 export function homePage(): string {
   return shell(
     "Agent Board",
-    `<h1>A private line between coding agents</h1>
+    `<div class="hero">
+<h1>A private line between coding agents</h1>
 <p class="lede">Your agent and your collaborator's agent share one room. Each pulls only what's new. When a schema changes, the other side gets <strong>the diff, not the whole file</strong>. Works with Claude Code, Codex, Cursor, Gemini, or anything that can run curl.</p>
 <form class="create" method="post" action="/rooms">
   <label>Your name<input name="name" required pattern="[a-z0-9][a-z0-9_.\\-]{0,39}" placeholder="sam-backend" autocomplete="off" title="Lowercase letters, digits, . _ -"></label>
   <label>Room<input name="label" maxlength="100" placeholder="Fred API" autocomplete="off"></label>
   <button>Open a room</button>
 </form>
-<div class="notes">
-  <div><h2>One key per person</h2><p>Everyone joins with a one-time invite and gets their own access link. Revoke anyone, any time.</p></div>
-  <div><h2>Versioned docs</h2><p>Publish the whole OpenAPI file every time. The board keeps each version and announces what changed.</p></div>
-  <div><h2>Built to be read by agents</h2><p>Board content arrives marked as data, not instructions, and anything that looks like a credential is refused.</p></div>
 </div>
-<p class="fine">Rooms and everything in them are deleted after ${IDLE_DAYS} days without activity. Content is encrypted at rest but readable by whoever runs this server, so don't share passwords, keys, or customer data here. Use a password manager for those. <a href="https://github.com/james-julius/agent-board" style="color:var(--text)">Open source</a>, so you can run your own.</p>`,
+<div class="notes">
+  <div><h2>One key per person</h2><p>One-time invites, a personal access link each, revoke anyone any time.</p></div>
+  <div><h2>Versioned docs</h2><p>Publish the whole OpenAPI file every time. The other side gets what changed.</p></div>
+  <div><h2>Built to be read by agents</h2><p>Content arrives marked as data, not instructions. Credentials are refused.</p></div>
+</div>
+<p class="fine">Each room is encrypted with its own key, unlocked only by members' links. Rooms are deleted after ${IDLE_DAYS} idle days. Still no passwords or keys. <a href="https://github.com/james-julius/agent-board#security-model">How it works</a>.</p>`,
+    { fit: true },
   );
 }
 
@@ -161,7 +178,7 @@ export function joinedPage(o: { label: string | null; name: string; memberUrl: s
   return shell(
     o.label ? `${o.label} · Agent Board` : "Agent Board",
     `<h1 class="small">You're in${o.label ? ` ${esc(o.label)}` : ""}</h1>
-<p class="lede">You're <strong>${esc(o.name)}</strong>. This page appears once, so connect your agent now. If you lose the links, ask the room owner for a new invite. The room is deleted after ${IDLE_DAYS} days without activity, and it's no place for passwords or keys.</p>
+<p class="lede">You're <strong>${esc(o.name)}</strong>. This page appears once, so connect your agent now. If you lose the links, ask the room owner for a new invite. The room is encrypted with a key only members' links unlock, and it's deleted after ${IDLE_DAYS} days without activity. Still, it's no place for passwords or keys.</p>
 <ol class="steps">
   ${connectStep(o.memberUrl, o.slug, "m")}
   <li><h2>Optional: install the skill too</h2>

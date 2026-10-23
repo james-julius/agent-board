@@ -1,6 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { createTwoFilesPatch, diffLines } from "diff";
 import { findSecret } from "./secrets";
+import { Buffer } from "node:buffer";
+import { hash, isSealed, kek, newRoomKey, open, seal, unwrapKey, wrapKey } from "./crypto";
 
 export type AskStatus = "open" | "taken" | "done";
 
@@ -59,6 +61,13 @@ const MAX_DOC = 1_500_000;
 const MAX_STORED_DIFF = 200_000;
 const NEW_SESSION_LOOKBACK_MS = 24 * 3600 * 1000;
 const ASK_COLUMNS = ["ask_status TEXT", "ask_to TEXT", "taken_by TEXT", "resolved_by TEXT", "resolved_at TEXT", "resolution TEXT"];
+// Columns added after launch, applied to rooms created before them.
+const ADDED_COLUMNS: Record<string, string[]> = {
+  messages: ASK_COLUMNS,
+  members: ["wrapped_key TEXT"],
+  invites: ["wrapped_key TEXT"],
+  docs: ["bytes INTEGER"],
+};
 const INVITE_TTL_MS = 7 * 24 * 3600 * 1000;
 const DAY_MS = 24 * 3600 * 1000;
 // A room and everything in it is erased once nobody has used it for this long.
@@ -91,6 +100,8 @@ function refuseSecrets(...texts: (string | null | undefined)[]) {
 
 export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
   private sql = this.ctx.storage.sql;
+  // The room key, unwrapped by whichever valid link last arrived. Held in memory only.
+  private key: Buffer | null = null;
   private idleMs = Number(this.env.ROOM_IDLE_MS) || IDLE_DAYS * DAY_MS;
 
   constructor(ctx: DurableObjectState, env: { ROOM_IDLE_MS?: string }) {
@@ -138,10 +149,73 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
         PRIMARY KEY (name, version)
       );
     `);
-    const have = new Set(this.sql.exec<{ name: string }>("PRAGMA table_info(messages)").toArray().map((c) => c.name));
-    for (const col of ASK_COLUMNS) {
-      if (!have.has(col.split(" ")[0])) this.sql.exec(`ALTER TABLE messages ADD COLUMN ${col}`);
+    for (const [table, cols] of Object.entries(ADDED_COLUMNS)) {
+      const have = new Set(this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray().map((c) => c.name));
+      for (const col of cols) {
+        if (!have.has(col.split(" ")[0])) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`);
+      }
     }
+    this.sql.exec("UPDATE docs SET bytes = LENGTH(content) WHERE bytes IS NULL");
+  }
+
+  // ---- encryption ----
+
+  private requireKey(): Buffer {
+    if (!this.key) throw new BoardError(503, "The room is locked. Retry the request.");
+    return this.key;
+  }
+
+  private enc(v: string): string;
+  private enc(v: string | null): string | null;
+  private enc(v: string | null): string | null {
+    return v === null ? null : seal(this.requireKey(), v);
+  }
+
+  private dec(v: string): string;
+  private dec(v: string | null): string | null;
+  private dec(v: string | null): string | null {
+    return v === null || !isSealed(v) ? v : open(this.requireKey(), v);
+  }
+
+  private decMsg = (m: Message): Message => ({ ...m, title: this.dec(m.title), body: this.dec(m.body), resolution: this.dec(m.resolution) });
+
+  private label(): string | null {
+    return this.dec(this.meta("label"));
+  }
+
+  private setMeta(k: string, v: string) {
+    this.sql.exec("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", k, v);
+  }
+
+  // Rooms created before encryption: encrypt everything in place under a new key. Members get their
+  // wrapped copy the next time they connect; until all have, the key waits in meta as pending_key.
+  private encryptLegacyRoom() {
+    if (this.meta("encrypted")) return;
+    this.ctx.storage.transactionSync(() => {
+      this.key = newRoomKey();
+      for (const m of this.sql.exec<Message>("SELECT id, title, body, resolution FROM messages").toArray()) {
+        this.sql.exec("UPDATE messages SET title = ?, body = ?, resolution = ? WHERE id = ?", this.enc(m.title), this.enc(m.body), this.enc(m.resolution), m.id);
+      }
+      for (const d of this.sql.exec<{ name: string; version: number; content: string; note: string | null }>("SELECT name, version, content, note FROM docs").toArray()) {
+        this.sql.exec("UPDATE docs SET content = ?, note = ? WHERE name = ? AND version = ?", this.enc(d.content), this.enc(d.note), d.name, d.version);
+      }
+      const label = this.meta("label");
+      if (label) this.setMeta("label", this.enc(label));
+      this.setMeta("encrypted", "1");
+      this.setMeta("pending_key", this.key.toString("base64"));
+    });
+  }
+
+  private usePendingKey(why: string) {
+    this.encryptLegacyRoom();
+    const pending = this.meta("pending_key");
+    if (!pending) throw new BoardError(410, why);
+    this.key = Buffer.from(pending, "base64");
+  }
+
+  private dropPendingKeyWhenDone() {
+    const left = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM members WHERE revoked_at IS NULL AND wrapped_key IS NULL").one().n;
+    if (!left) this.sql.exec("DELETE FROM meta WHERE k = 'pending_key'");
   }
 
   // ---- expiry ----
@@ -165,57 +239,78 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
     }
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
+    this.key = null;
     // Recreate empty tables so any request still routed here gets a clean 401/404 instead of a SQL error.
     this.migrate();
   }
 
   // ---- membership ----
 
-  async init(input: { label: string | null; owner: string; ownerTokenHash: string; inviteHash: string }): Promise<void> {
+  async init(input: { label: string | null; owner: string; ownerSecret: string; inviteCode: string }): Promise<void> {
     if (this.meta("created_at")) throw new BoardError(409, "Room already exists.");
     const owner = cleanAgentName(input.owner);
     const now = new Date().toISOString();
+    this.key = newRoomKey();
     this.sql.exec("INSERT INTO meta (k, v) VALUES ('created_at', ?)", now);
-    if (input.label) this.sql.exec("INSERT INTO meta (k, v) VALUES ('label', ?)", input.label.slice(0, 100));
-    this.sql.exec("INSERT INTO members (name, token_hash, role, created_at) VALUES (?, ?, 'owner', ?)", owner, input.ownerTokenHash, now);
-    this.insertInvite(owner, input.inviteHash);
+    this.setMeta("encrypted", "1");
+    if (input.label) this.setMeta("label", this.enc(input.label.slice(0, 100)));
+    this.sql.exec(
+      "INSERT INTO members (name, token_hash, wrapped_key, role, created_at) VALUES (?, ?, ?, 'owner', ?)",
+      owner, hash(input.ownerSecret), wrapKey(kek(input.ownerSecret, "member"), this.key), now,
+    );
+    this.insertInvite(owner, input.inviteCode);
     await this.touch();
   }
 
-  async session(tokenHash: string): Promise<Session> {
+  async session(secret: string): Promise<Session> {
     const m = this.sql
-      .exec<{ name: string; role: Member["role"] }>("SELECT name, role FROM members WHERE token_hash = ? AND revoked_at IS NULL", tokenHash)
+      .exec<{ name: string; role: Member["role"]; wrapped_key: string | null }>(
+        "SELECT name, role, wrapped_key FROM members WHERE token_hash = ? AND revoked_at IS NULL",
+        hash(secret),
+      )
       .toArray()[0];
     if (!m) throw new BoardError(401, "Invalid or revoked access token.");
+    if (m.wrapped_key) {
+      this.key = unwrapKey(kek(secret, "member"), m.wrapped_key);
+    } else {
+      this.usePendingKey("This access link predates encryption and can no longer unlock the room. Ask the room owner for a new invite.");
+      this.sql.exec("UPDATE members SET wrapped_key = ? WHERE name = ?", wrapKey(kek(secret, "member"), this.key!), m.name);
+      this.dropPendingKeyWhenDone();
+    }
     await this.touch();
-    return { label: this.meta("label"), name: m.name, role: m.role };
+    return { label: this.label(), name: m.name, role: m.role };
   }
 
-  async createInvite(by: string, codeHash: string): Promise<{ expires_at: string }> {
+  async createInvite(by: string, code: string): Promise<{ expires_at: string }> {
     this.requireOwner(by);
-    return { expires_at: this.insertInvite(by, codeHash) };
+    return { expires_at: this.insertInvite(by, code) };
   }
 
-  async inviteInfo(codeHash: string): Promise<{ label: string | null; invited_by: string; expires_at: string }> {
-    const inv = this.usableInvite(codeHash);
-    return { label: this.meta("label"), invited_by: inv.created_by, expires_at: inv.expires_at };
+  async inviteInfo(code: string): Promise<{ label: string | null; invited_by: string; expires_at: string }> {
+    const inv = this.unlockWithInvite(code);
+    return { label: this.label(), invited_by: inv.created_by, expires_at: inv.expires_at };
   }
 
-  async redeemInvite(codeHash: string, rawName: string, tokenHash: string): Promise<Session> {
-    this.usableInvite(codeHash);
+  async redeemInvite(code: string, rawName: string, secret: string): Promise<Session> {
+    const codeHash = hash(code);
+    this.unlockWithInvite(code);
+    const tokenHash = hash(secret);
+    const wrapped = wrapKey(kek(secret, "member"), this.requireKey());
     const name = cleanAgentName(rawName);
     const existing = this.sql.exec<Member>("SELECT * FROM members WHERE name = ?", name).toArray()[0];
     if (existing && !existing.revoked_at) throw new BoardError(409, `The name "${name}" is already taken in this room. Pick another.`);
     const now = new Date().toISOString();
     if (existing) {
       // Re-inviting someone whose access was revoked.
-      this.sql.exec("UPDATE members SET token_hash = ?, revoked_at = NULL, created_at = ? WHERE name = ?", tokenHash, now, name);
+      this.sql.exec("UPDATE members SET token_hash = ?, wrapped_key = ?, revoked_at = NULL, created_at = ? WHERE name = ?", tokenHash, wrapped, now, name);
     } else {
-      this.sql.exec("INSERT INTO members (name, token_hash, role, created_at) VALUES (?, ?, 'member', ?)", name, tokenHash, now);
+      this.sql.exec("INSERT INTO members (name, token_hash, wrapped_key, role, created_at) VALUES (?, ?, ?, 'member', ?)", name, tokenHash, wrapped, now);
     }
-    this.sql.exec("UPDATE invites SET used_by = ?, used_at = ? WHERE code_hash = ?", name, now, codeHash);
+    // A used invite no longer needs its copy of the key.
+    this.sql.exec("UPDATE invites SET used_by = ?, used_at = ?, wrapped_key = NULL WHERE code_hash = ?", name, now, codeHash);
+    this.dropPendingKeyWhenDone();
     await this.touch();
-    return { label: this.meta("label"), name, role: "member" };
+    return { label: this.label(), name, role: "member" };
   }
 
   async listMembers(): Promise<Member[]> {
@@ -226,12 +321,13 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
     this.requireOwner(by);
     const name = cleanAgentName(rawName);
     if (name === by) throw new BoardError(400, "You can't revoke yourself. Rotate your token instead.");
-    const r = this.sql.exec("UPDATE members SET revoked_at = ? WHERE name = ? AND revoked_at IS NULL", new Date().toISOString(), name);
+    const r = this.sql.exec("UPDATE members SET revoked_at = ?, wrapped_key = NULL WHERE name = ? AND revoked_at IS NULL", new Date().toISOString(), name);
     if (!r.rowsWritten) throw new BoardError(404, `No active member named "${name}".`);
   }
 
-  async rotateToken(name: string, newTokenHash: string): Promise<void> {
-    this.sql.exec("UPDATE members SET token_hash = ? WHERE name = ? AND revoked_at IS NULL", newTokenHash, name);
+  async rotateToken(name: string, newSecret: string): Promise<void> {
+    const wrapped = wrapKey(kek(newSecret, "member"), this.requireKey());
+    this.sql.exec("UPDATE members SET token_hash = ?, wrapped_key = ? WHERE name = ? AND revoked_at IS NULL", hash(newSecret), wrapped, name);
   }
 
   // ---- messages ----
@@ -287,7 +383,7 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
     const now = new Date().toISOString();
     this.sql.exec(
       "UPDATE messages SET ask_status = 'done', taken_by = COALESCE(taken_by, ?), resolved_by = ?, resolved_at = ?, resolution = ? WHERE id = ?",
-      by, by, now, text.slice(0, 4000), id,
+      by, by, now, this.enc(text.slice(0, 4000)), id,
     );
     const reply = this.insertMessage({
       author: by,
@@ -318,7 +414,7 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
     else if (status !== "all") (where.push("ask_status = ?"), args.push(status));
     if (opts.forName) (where.push("(ask_to IS NULL OR ask_to = ?) AND author != ?"), args.push(opts.forName, opts.forName));
     if (opts.byName) (where.push("author = ?"), args.push(opts.byName));
-    return this.sql.exec<Message>(`SELECT * FROM messages WHERE ${where.join(" AND ")} ORDER BY id ASC LIMIT 200`, ...args).toArray();
+    return this.sql.exec<Message>(`SELECT * FROM messages WHERE ${where.join(" AND ")} ORDER BY id ASC LIMIT 200`, ...args).toArray().map(this.decMsg);
   }
 
   // Messages from other members since the cursor. Advances it unless peek.
@@ -329,7 +425,8 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
     const cursor = this.cursorFor(key, !!session);
     const messages = this.sql
       .exec<Message>("SELECT * FROM messages WHERE id > ? AND author != ? ORDER BY id ASC LIMIT 200", cursor, reader)
-      .toArray();
+      .toArray()
+      .map(this.decMsg);
     if (!peek) {
       const maxId = this.sql.exec<{ m: number | null }>("SELECT MAX(id) AS m FROM messages").one().m ?? 0;
       // Only skip past what we returned when the limit cut the list short.
@@ -355,13 +452,13 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
     const rows = before
       ? this.sql.exec<Message>("SELECT * FROM messages WHERE id < ? ORDER BY id DESC LIMIT ?", before, n).toArray()
       : this.sql.exec<Message>("SELECT * FROM messages ORDER BY id DESC LIMIT ?", n).toArray();
-    return rows.reverse();
+    return rows.reverse().map(this.decMsg);
   }
 
   async get(id: number): Promise<Message & { replies: Message[] }> {
     const msg = this.findMessage(id);
     if (!msg) throw new BoardError(404, `Message ${id} not found.`);
-    const replies = this.sql.exec<Message>("SELECT * FROM messages WHERE reply_to = ? ORDER BY id", id).toArray();
+    const replies = this.sql.exec<Message>("SELECT * FROM messages WHERE reply_to = ? ORDER BY id", id).toArray().map(this.decMsg);
     return { ...msg, replies };
   }
 
@@ -383,14 +480,15 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
     const prev = this.sql
       .exec<{ version: number; content: string }>("SELECT version, content FROM docs WHERE name = ? ORDER BY version DESC LIMIT 1", name)
       .toArray()[0];
+    if (prev) prev.content = this.dec(prev.content);
     if (prev && prev.content === content) {
       return { doc: this.docMeta(name, prev.version)!, unchanged: true, stats: null, message_id: null };
     }
 
     const version = (prev?.version ?? 0) + 1;
     this.sql.exec(
-      "INSERT INTO docs (name, version, content, author, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-      name, version, content, input.from, note, new Date().toISOString(),
+      "INSERT INTO docs (name, version, content, bytes, author, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      name, version, this.enc(content), content.length, input.from, this.enc(note), new Date().toISOString(),
     );
 
     let body: string;
@@ -420,12 +518,13 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
   async listDocs(): Promise<DocVersion[]> {
     return this.sql
       .exec<DocVersion>(
-        `SELECT d.name, d.version, d.author, d.note, d.created_at, LENGTH(d.content) AS bytes
+        `SELECT d.name, d.version, d.author, d.note, d.created_at, d.bytes
          FROM docs d JOIN (SELECT name, MAX(version) AS v FROM docs GROUP BY name) m
            ON d.name = m.name AND d.version = m.v
          ORDER BY d.created_at DESC`,
       )
-      .toArray();
+      .toArray()
+      .map((d) => ({ ...d, note: this.dec(d.note) }));
   }
 
   async getDoc(nameRaw: string, version?: number | null): Promise<DocVersion & { content: string; history: DocVersion[] }> {
@@ -434,10 +533,11 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
       ? this.sql.exec<{ version: number }>("SELECT version FROM docs WHERE name = ? AND version = ?", name, version).toArray()[0]
       : this.sql.exec<{ version: number }>("SELECT version FROM docs WHERE name = ? ORDER BY version DESC LIMIT 1", name).toArray()[0];
     if (!row) throw new BoardError(404, `Doc ${name}${version ? ` v${version}` : ""} not found.`);
-    const content = this.sql.exec<{ content: string }>("SELECT content FROM docs WHERE name = ? AND version = ?", name, row.version).one().content;
+    const content = this.dec(this.sql.exec<{ content: string }>("SELECT content FROM docs WHERE name = ? AND version = ?", name, row.version).one().content);
     const history = this.sql
-      .exec<DocVersion>("SELECT name, version, author, note, created_at, LENGTH(content) AS bytes FROM docs WHERE name = ? ORDER BY version", name)
-      .toArray();
+      .exec<DocVersion>("SELECT name, version, author, note, created_at, bytes FROM docs WHERE name = ? ORDER BY version", name)
+      .toArray()
+      .map((d) => ({ ...d, note: this.dec(d.note) }));
     return { ...this.docMeta(name, row.version)!, content, history };
   }
 
@@ -451,7 +551,7 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
     const load = (v: number) => {
       const r = this.sql.exec<{ content: string }>("SELECT content FROM docs WHERE name = ? AND version = ?", name, v).toArray()[0];
       if (!r) throw new BoardError(404, `Doc ${name} v${v} not found.`);
-      return r.content;
+      return this.dec(r.content);
     };
     const a = load(fromV);
     const b = load(toV);
@@ -475,20 +575,27 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
     if (role !== "owner") throw new BoardError(403, "Only the room owner can do that.");
   }
 
-  private insertInvite(by: string, codeHash: string): string {
+  private insertInvite(by: string, code: string): string {
     const now = Date.now();
     const expires = new Date(now + INVITE_TTL_MS).toISOString();
     this.sql.exec(
-      "INSERT INTO invites (code_hash, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)",
-      codeHash, by, new Date(now).toISOString(), expires,
+      "INSERT INTO invites (code_hash, wrapped_key, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+      hash(code), wrapKey(kek(code, "invite"), this.requireKey()), by, new Date(now).toISOString(), expires,
     );
     return expires;
   }
 
+  private unlockWithInvite(code: string) {
+    const inv = this.usableInvite(hash(code));
+    if (inv.wrapped_key) this.key = unwrapKey(kek(code, "invite"), inv.wrapped_key);
+    else this.usePendingKey("This invite predates encryption. Ask the room owner for a new one.");
+    return inv;
+  }
+
   private usableInvite(codeHash: string) {
     const inv = this.sql
-      .exec<{ created_by: string; expires_at: string; used_by: string | null }>(
-        "SELECT created_by, expires_at, used_by FROM invites WHERE code_hash = ?",
+      .exec<{ created_by: string; expires_at: string; used_by: string | null; wrapped_key: string | null }>(
+        "SELECT created_by, expires_at, used_by, wrapped_key FROM invites WHERE code_hash = ?",
         codeHash,
       )
       .toArray()[0];
@@ -526,23 +633,26 @@ export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
   }
 
   private findMessage(id: number): Message | undefined {
-    return this.sql.exec<Message>("SELECT * FROM messages WHERE id = ?", id).toArray()[0];
+    const m = this.sql.exec<Message>("SELECT * FROM messages WHERE id = ?", id).toArray()[0];
+    return m && this.decMsg(m);
   }
 
   private docMeta(name: string, version: number): DocVersion | undefined {
     return this.sql
-      .exec<DocVersion>("SELECT name, version, author, note, created_at, LENGTH(content) AS bytes FROM docs WHERE name = ? AND version = ?", name, version)
-      .toArray()[0];
+      .exec<DocVersion>("SELECT name, version, author, note, created_at, bytes FROM docs WHERE name = ? AND version = ?", name, version)
+      .toArray()
+      .map((d) => ({ ...d, note: this.dec(d.note) }))[0];
   }
 
   private insertMessage(m: Omit<Message, "id" | "created_at" | "taken_by" | "resolved_by" | "resolved_at" | "resolution">): Message {
-    return this.sql
+    const row = this.sql
       .exec<Message>(
         `INSERT INTO messages (author, kind, title, body, reply_to, doc, doc_version, ask_status, ask_to, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-        m.author, m.kind, m.title, m.body, m.reply_to, m.doc, m.doc_version, m.ask_status, m.ask_to, new Date().toISOString(),
+        m.author, m.kind, this.enc(m.title), this.enc(m.body), m.reply_to, m.doc, m.doc_version, m.ask_status, m.ask_to, new Date().toISOString(),
       )
       .one();
+    return this.decMsg(row);
   }
 }
 

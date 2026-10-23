@@ -12,7 +12,8 @@ interface Env {
   CREATE_LIMIT: RateLimit;
 }
 
-// Credentials look like <room slug>.<secret>. The slug routes to the room; only a hash of the secret is stored.
+// Credentials look like <room slug>.<secret>. The slug routes to the room; the room stores only a hash of the
+// secret plus a copy of its encryption key wrapped under the secret.
 const CRED_RE = /^([A-Za-z0-9_-]{16})\.([A-Za-z0-9_-]{43})$/;
 const SECURITY_HEADERS = {
   "Cache-Control": "no-store",
@@ -54,7 +55,7 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (!cred) return text("Invalid or revoked access token.", 401);
   const [, slug, secret] = cred;
   const room = roomStub(env, slug);
-  const me = await room.session(await sha256(secret));
+  const me = await room.session(secret);
   const memberUrl = `${url.origin}/r/${parts[1]}`;
   const json = wantsJson(url);
   const [section, ...rest] = parts.slice(2);
@@ -63,7 +64,7 @@ async function route(req: Request, env: Env): Promise<Response> {
 
   const makeInvite = async () => {
     const code = randomToken(16);
-    const { expires_at } = await room.createInvite(me.name, await sha256(code));
+    const { expires_at } = await room.createInvite(me.name, code);
     return { url: `${url.origin}/join/${slug}.${code}`, expires_at };
   };
 
@@ -164,7 +165,7 @@ async function route(req: Request, env: Env): Promise<Response> {
 
   if (section === "rotate" && rest.length === 0 && method === "POST") {
     const fresh = randomToken(32);
-    await room.rotateToken(me.name, await sha256(fresh));
+    await room.rotateToken(me.name, fresh);
     const newUrl = `${url.origin}/r/${slug}.${fresh}`;
     const p = installPaths(me.label);
     return markdown(
@@ -227,7 +228,7 @@ async function createRoom(req: Request, env: Env, url: URL): Promise<Response> {
   const slug = randomToken(12);
   const secret = randomToken(32);
   const code = randomToken(16);
-  await roomStub(env, slug).init({ label, owner, ownerTokenHash: await sha256(secret), inviteHash: await sha256(code) });
+  await roomStub(env, slug).init({ label, owner, ownerSecret: secret, inviteCode: code });
 
   const memberUrl = `${url.origin}/r/${slug}.${secret}`;
   const inviteUrl = `${url.origin}/join/${slug}.${code}`;
@@ -241,12 +242,11 @@ async function join(req: Request, env: Env, url: URL, raw: string): Promise<Resp
   if (!m) return text("Invite not found.", 404);
   const [, slug, code] = m;
   const room = roomStub(env, slug);
-  const codeHash = await sha256(code);
   const joinUrl = `${url.origin}/join/${raw}`;
 
   // GET only describes the invite, so link previews in chat apps can't use it up.
   if (req.method === "GET") {
-    const info = await room.inviteInfo(codeHash);
+    const info = await room.inviteInfo(code);
     const md = renderJoin({ joinUrl, label: info.label, invitedBy: info.invited_by, expiresAt: info.expires_at });
     if (!(req.headers.get("Accept") ?? "").includes("text/html")) return markdown(md);
     return html(joinPage({ label: info.label, invitedBy: info.invited_by, expiresAt: info.expires_at, ...installCommands({ url: joinUrl, post: true }, info.label) }));
@@ -258,7 +258,7 @@ async function join(req: Request, env: Env, url: URL, raw: string): Promise<Resp
     ? String((await req.formData()).get("name") ?? "").trim()
     : (url.searchParams.get("name") ?? (await readInput(req, url)).body.trim());
   const secret = randomToken(32);
-  const me = await room.redeemInvite(codeHash, name, await sha256(secret));
+  const me = await room.redeemInvite(code, name, secret);
   const memberUrl = `${url.origin}/r/${slug}.${secret}`;
   if (isForm) {
     const install = installCommands({ url: `${memberUrl}/skill` }, me.label);
@@ -297,11 +297,6 @@ const roomStub = (env: Env, slug: string) => env.ROOM.get(env.ROOM.idFromName(`r
 function randomToken(bytes: number): string {
   const buf = crypto.getRandomValues(new Uint8Array(bytes));
   return btoa(String.fromCharCode(...buf)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-async function sha256(s: string): Promise<string> {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
-  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 const wantsJson = (url: URL) => url.searchParams.get("format") === "json";
