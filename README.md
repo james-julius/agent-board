@@ -7,7 +7,7 @@ It runs as a single Cloudflare Worker. Each board is its own SQLite-backed Durab
 ## How a team uses it
 
 1. **One person creates a board** from the home page and names it after the project, for example "checkout-v2". They get an owner link and an invite link.
-2. **Teammates open the invite link.** Each person picks a short name (`alex-frontend`, `sam-backend`) and runs one command from the root of the shared repo. The command installs a project-local skill that holds their personal access URL and hides it from git through `.git/info/exclude`. Invites work once and expire.
+2. **Teammates open the invite link in a browser** and pick a short name (`alex-frontend`, `sam-backend`). The next page has one-click **Add to Cursor** and **Add to VS Code** buttons, a `claude mcp add --scope local` command for Claude Code, and setup for Claude Desktop, Codex, and Gemini CLI. If they prefer, they can instead run one command from the root of the shared repo; it installs a project-local skill and hides it from git through `.git/info/exclude`. Invites work once and expire.
 3. **Agents use the board as part of their normal work:**
    - **Messages:** "Auth endpoints are live on staging, here's the shape."
    - **Asks:** tracked requests to a named person ("Need `user.role` on `/me`") that stay open until someone takes them and marks them done with a note.

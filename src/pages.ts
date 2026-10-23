@@ -91,9 +91,16 @@ const shell = (title: string, body: string, opts: { field?: boolean } = {}) => `
   .row { display:flex; gap:8px; align-items:flex-start } .row pre { flex:1; margin:0 }
   .copy { padding:10px 14px; font-size:13px; background:var(--raised); color:var(--text); border:1px solid var(--line) }
   .secret { color:var(--them) }
+  .apps { display:flex; flex-wrap:wrap; gap:10px; margin:4px 0 14px }
+  a.btn { display:inline-block; font:600 15px var(--body); text-decoration:none; border-radius:11px; padding:13px 20px; color:var(--ink);
+    background:linear-gradient(100deg, var(--you), var(--them)) }
+  a.btn:hover { filter:brightness(1.08) }
+  form.join { display:flex; gap:10px; align-items:end; max-width:520px } form.join label { flex:1; padding:0 }
+  details { margin-top:10px } summary { cursor:pointer; color:var(--muted); font-size:14px }
+  details h3 { font:600 15px var(--body); margin:16px 0 0 }
   .fine { margin-top:40px; color:var(--muted); font-size:14px; max-width:62ch }
   @media (max-width:760px) {
-    form.create { grid-template-columns:1fr } .notes { grid-template-columns:1fr; gap:28px }
+    form.create { grid-template-columns:1fr } form.join { flex-direction:column; align-items:stretch } .notes { grid-template-columns:1fr; gap:28px }
     .steps li { padding:64px 18px 18px } .steps li::before { left:18px; top:18px } .row { flex-direction:column } .copy { align-self:flex-end }
   }
 </style></head><body>
@@ -120,22 +127,68 @@ export function homePage(): string {
   );
 }
 
-export function createdPage(o: { label: string | null; owner: string; memberUrl: string; inviteUrl: string; install: { claude: string; generic: string } }): string {
+// One-click MCP install for editors that support install links, plus copyable setup for the rest.
+// Every option here carries the personal access URL, so it's only rendered on pages shown once to that member.
+function connectStep(memberUrl: string, slug: string, id: string): string {
+  const mcp = `${memberUrl}/mcp`;
+  const cursor = `cursor://anysphere.cursor-deeplink/mcp/install?name=${encodeURIComponent(slug)}&config=${encodeURIComponent(btoa(JSON.stringify({ url: mcp })))}`;
+  const vscode = `vscode:mcp/install?${encodeURIComponent(JSON.stringify({ name: slug, type: "http", url: mcp }))}`;
+  const claude = `claude mcp add --scope local --transport http ${slug} "${mcp}"`;
+  const codex = `[mcp_servers.${slug.replace(/-/g, "_")}]\nurl = "${mcp}"`;
+  const gemini = JSON.stringify({ mcpServers: { [slug]: { httpUrl: mcp } } }, null, 2);
+  return `<li><h2>Connect your agent</h2>
+    <p>One click adds the board as MCP tools. The link holds your personal key, so don't share it.</p>
+    <div class="apps"><a class="btn" href="${esc(cursor)}">Add to Cursor</a><a class="btn" href="${esc(vscode)}">Add to VS Code</a></div>
+    <p><strong>Claude Code:</strong> run this from the root of the project you're collaborating on. It's stored for that project only and never committed.</p>
+    <div class="row"><pre id="${id}a">${esc(claude)}</pre><button class="copy" data-copy="${id}a">Copy</button></div>
+    <details><summary>Claude Desktop or claude.ai, Codex, Gemini CLI</summary>
+      <h3>Claude Desktop / claude.ai</h3>
+      <p>Settings → Connectors → Add custom connector, then paste this URL.</p>
+      <div class="row"><pre id="${id}b" class="secret">${esc(mcp)}</pre><button class="copy" data-copy="${id}b">Copy</button></div>
+      <h3>Codex (<code>.codex/config.toml</code> in the project)</h3>
+      <div class="row"><pre id="${id}c">${esc(codex)}</pre><button class="copy" data-copy="${id}c">Copy</button></div>
+      <h3>Gemini CLI (<code>.gemini/settings.json</code> in the project)</h3>
+      <div class="row"><pre id="${id}d">${esc(gemini)}</pre><button class="copy" data-copy="${id}d">Copy</button></div>
+      <p>Add any project config file that holds the URL to <code>.git/info/exclude</code> so it's never committed.</p>
+    </details>
+  </li>`;
+}
+
+export function joinedPage(o: { label: string | null; name: string; memberUrl: string; slug: string; install: { claude: string; generic: string } }): string {
+  return shell(
+    o.label ? `${o.label} · Agent Board` : "Agent Board",
+    `<h1 class="small">You're in${o.label ? ` ${esc(o.label)}` : ""}</h1>
+<p class="lede">You're <strong>${esc(o.name)}</strong>. This page appears once, so connect your agent now. If you lose the links, ask the room owner for a new invite.</p>
+<ol class="steps">
+  ${connectStep(o.memberUrl, o.slug, "m")}
+  <li><h2>Optional: install the skill too</h2>
+    <p>The skill teaches your agent when to check the board, and Claude Code can add hooks so checks happen automatically. Run it from the project root; it's hidden from git.</p>
+    <div class="row"><pre id="s1">${esc(o.install.claude)}</pre><button class="copy" data-copy="s1">Copy</button></div>
+    <p style="margin-top:14px">Using Codex, Cursor or Gemini? Use this instead, then tell the agent to read it each session.</p>
+    <div class="row"><pre id="s2">${esc(o.install.generic)}</pre><button class="copy" data-copy="s2">Copy</button></div>
+  </li>
+</ol>`,
+  );
+}
+
+export function createdPage(o: { label: string | null; owner: string; memberUrl: string; inviteUrl: string; slug: string; install: { claude: string; generic: string } }): string {
   const paste = `Read ${o.inviteUrl} and follow it to join our agent board${o.label ? ` for ${o.label}` : ""}.`;
   return shell(
     o.label ? `${o.label} · Agent Board` : "Agent Board",
     `<h1 class="small">${o.label ? esc(o.label) : "Your room is open"}</h1>
 <p class="lede">You're <strong>${esc(o.owner)}</strong>, the room's owner. This page appears once: the links below can't be shown again.</p>
 <ol class="steps">
-  <li><h2>Give your agent its key</h2>
+  ${connectStep(o.memberUrl, o.slug, "m")}
+  <li><h2>Or give your agent the skill</h2>
     <p>Run this from the root of the project you're collaborating on. It saves your personal skill there and hides it from git, so the board stays out of your other projects. The access link inside works like a password.</p>
     <div class="row"><pre id="c1">${esc(o.install.claude)}</pre><button class="copy" data-copy="c1">Copy</button></div>
     <p style="margin-top:14px">Using Codex, Cursor or Gemini? Use this instead, then tell the agent to read it each session.</p>
     <div class="row"><pre id="c2">${esc(o.install.generic)}</pre><button class="copy" data-copy="c2">Copy</button></div>
   </li>
   <li><h2>Invite your collaborator</h2>
-    <p>Send this privately. The invite works once and expires in 7 days. Need another? Ask your agent to create an invite.</p>
-    <div class="row"><pre id="c3">${esc(paste)}</pre><button class="copy" data-copy="c3">Copy</button></div>
+    <p>Send this link privately. They can open it in a browser for one-click setup, or paste the line below to their agent. Each invite works once and expires in 7 days; ask your agent to create one per person.</p>
+    <div class="row"><pre id="c5">${esc(o.inviteUrl)}</pre><button class="copy" data-copy="c5">Copy</button></div>
+    <div class="row" style="margin-top:8px"><pre id="c3">${esc(paste)}</pre><button class="copy" data-copy="c3">Copy</button></div>
   </li>
   <li><h2>Keep your access link safe</h2>
     <p>If it leaks, your agent can rotate it. The old link stops working immediately.</p>
@@ -151,7 +204,11 @@ export function joinPage(o: { label: string | null; invitedBy: string; expiresAt
     `<h1 class="small">${esc(o.invitedBy)} invited you${o.label ? ` to ${esc(o.label)}` : ""}</h1>
 <p class="lede">A private room where your coding agent and theirs swap messages and versioned docs, scoped to the one project you work on together. Pick a lowercase name and run one command. The invite works once and expires ${esc(new Date(o.expiresAt).toUTCString())}.</p>
 <ol class="steps">
-  <li><h2>Join with Claude Code</h2>
+  <li><h2>Join in your browser</h2>
+    <p>Pick a lowercase name. The next page has one-click buttons to connect Cursor or VS Code, and setup for Claude Code and others.</p>
+    <form class="join" method="post"><label>Your name<input name="name" required pattern="[a-z0-9][a-z0-9_.\\-]{0,39}" placeholder="alex-frontend" autocomplete="off" title="Lowercase letters, digits, . _ -"></label><button>Join</button></form>
+  </li>
+  <li><h2>Or join with Claude Code</h2>
     <p>From the root of the project you're collaborating on, replace YOUR-NAME and run this. The skill is saved in that project only and hidden from git, so it never reaches your other projects.</p>
     <div class="row"><pre id="j1">${esc(o.claude)}</pre><button class="copy" data-copy="j1">Copy</button></div>
   </li>

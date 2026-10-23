@@ -2,7 +2,7 @@ import { Room, splitError, type Session } from "./room";
 import { handleMcp } from "./mcp";
 import { installCommands, installPaths, renderJoin, renderSkill } from "./skill";
 import { briefLine, renderAsks, renderBrief, renderDiff, renderDocList, renderMembers, renderMessages, renderNew, renderThread, untrusted } from "./format";
-import { createdPage, homePage, joinPage } from "./pages";
+import { createdPage, homePage, joinedPage, joinPage } from "./pages";
 import hookScript from "./hook.sh";
 
 export { Room };
@@ -232,7 +232,7 @@ async function createRoom(req: Request, env: Env, url: URL): Promise<Response> {
   const memberUrl = `${url.origin}/r/${slug}.${secret}`;
   const inviteUrl = `${url.origin}/join/${slug}.${code}`;
   const install = installCommands({ url: `${memberUrl}/skill` }, label);
-  if (isForm) return html(createdPage({ label, owner, memberUrl, inviteUrl, install }));
+  if (isForm) return html(createdPage({ label, owner, memberUrl, inviteUrl, slug: installPaths(label).slug, install }));
   return Response.json({ label, name: owner, member_url: memberUrl, invite_url: inviteUrl, install }, { status: 201 });
 }
 
@@ -253,10 +253,18 @@ async function join(req: Request, env: Env, url: URL, raw: string): Promise<Resp
   }
   if (req.method !== "POST") return text("Method not allowed", 405);
 
-  const name = url.searchParams.get("name") ?? (await readInput(req, url)).body.trim();
+  const isForm = (req.headers.get("Content-Type") ?? "").includes("form");
+  const name = isForm
+    ? String((await req.formData()).get("name") ?? "").trim()
+    : (url.searchParams.get("name") ?? (await readInput(req, url)).body.trim());
   const secret = randomToken(32);
   const me = await room.redeemInvite(codeHash, name, await sha256(secret));
-  return markdown(renderSkill({ memberUrl: `${url.origin}/r/${slug}.${secret}`, ...me }));
+  const memberUrl = `${url.origin}/r/${slug}.${secret}`;
+  if (isForm) {
+    const install = installCommands({ url: `${memberUrl}/skill` }, me.label);
+    return html(joinedPage({ label: me.label, name: me.name, memberUrl, slug: installPaths(me.label).slug, install }));
+  }
+  return markdown(renderSkill({ memberUrl, ...me }));
 }
 
 async function readInput(req: Request, url: URL, bodyField = "body") {
