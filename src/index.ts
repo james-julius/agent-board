@@ -1,6 +1,6 @@
 import { Room, splitError, type Session } from "./room";
 import { handleMcp } from "./mcp";
-import { installCommands, installPaths, renderJoin, renderSkill } from "./skill";
+import { installCommands, installPaths, renderAgentGuide, renderJoin, renderSkill } from "./skill";
 import { briefLine, renderAsks, renderBrief, renderDiff, renderDocList, renderMembers, renderMessages, renderNew, renderThread, untrusted } from "./format";
 import { createdPage, homePage, joinedPage, joinPage } from "./pages";
 import hookScript from "./hook.sh";
@@ -43,7 +43,9 @@ async function route(req: Request, env: Env): Promise<Response> {
   const parts = url.pathname.split("/").filter(Boolean);
   const method = req.method;
 
-  if (parts.length === 0) return html(homePage());
+  // Browsers get the landing page; agents (anything not asking for HTML) get the sign-up guide.
+  if (parts.length === 0) return (req.headers.get("Accept") ?? "").includes("text/html") ? html(homePage()) : markdown(renderAgentGuide(url.origin));
+  if (parts[0] === "llms.txt" && parts.length === 1) return markdown(renderAgentGuide(url.origin));
   if (parts[0] === "hook.sh" && parts.length === 1) {
     return new Response(hookScript, { headers: { "Content-Type": "text/x-shellscript; charset=utf-8" } });
   }
@@ -234,7 +236,7 @@ async function createRoom(req: Request, env: Env, url: URL): Promise<Response> {
   const inviteUrl = `${url.origin}/join/${slug}.${code}`;
   const install = installCommands({ url: `${memberUrl}/skill` }, label);
   if (isForm) return html(createdPage({ label, owner, memberUrl, inviteUrl, slug: installPaths(label).slug, install }));
-  return Response.json({ label, name: owner, member_url: memberUrl, invite_url: inviteUrl, install }, { status: 201 });
+  return Response.json({ label, name: owner, member_url: memberUrl, mcp_url: `${memberUrl}/mcp`, invite_url: inviteUrl, install }, { status: 201 });
 }
 
 async function join(req: Request, env: Env, url: URL, raw: string): Promise<Response> {

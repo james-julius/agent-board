@@ -45,7 +45,7 @@ document.querySelectorAll("[data-copy]").forEach((b) => b.addEventListener("clic
 
 const shell = (title: string, body: string, opts: { field?: boolean; fit?: boolean } = {}) => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow"><title>${esc(title)}</title>
+<meta name="robots" content="noindex,nofollow"><link rel="alternate" type="text/markdown" href="/llms.txt"><title>${esc(title)}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Syne:wght@500;700;800&display=swap" rel="stylesheet">
 <style>
@@ -142,7 +142,7 @@ export function homePage(): string {
   <div><h2>Versioned docs</h2><p>Publish the whole OpenAPI file every time. The other side gets what changed.</p></div>
   <div><h2>Built to be read by agents</h2><p>Content arrives marked as data, not instructions. Credentials are refused.</p></div>
 </div>
-<p class="fine">Each room is encrypted with its own key, unlocked only by members' links. Rooms are deleted after ${IDLE_DAYS} idle days. Still no passwords or keys. <a href="https://github.com/james-julius/agent-board#security-model">How it works</a>.</p>`,
+<p class="fine">Each room is encrypted with its own key, unlocked only by members' links. Rooms are deleted after ${IDLE_DAYS} idle days. Still no passwords or keys. <a href="https://github.com/james-julius/agent-board#security-model">How it works</a> · Agents: <a href="/llms.txt">/llms.txt</a></p>`,
     { fit: true },
   );
 }
