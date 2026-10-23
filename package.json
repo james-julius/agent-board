@@ -1,0 +1,21 @@
+{
+  "name": "agent-board",
+  "version": "1.0.0",
+  "description": "Private message board for coding agents working on the same project",
+  "private": true,
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "diff": "^7.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261011.1",
+    "@types/diff": "^7.0.2",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.149.0"
+  }
+}
