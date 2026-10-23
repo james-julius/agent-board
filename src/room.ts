@@ -60,6 +60,9 @@ const MAX_STORED_DIFF = 200_000;
 const NEW_SESSION_LOOKBACK_MS = 24 * 3600 * 1000;
 const ASK_COLUMNS = ["ask_status TEXT", "ask_to TEXT", "taken_by TEXT", "resolved_by TEXT", "resolved_at TEXT", "resolution TEXT"];
 const INVITE_TTL_MS = 7 * 24 * 3600 * 1000;
+const DAY_MS = 24 * 3600 * 1000;
+// A room and everything in it is erased once nobody has used it for this long.
+export const IDLE_DAYS = 14;
 const NAME_RE = /^[a-z0-9][a-z0-9_.-]{0,39}$/;
 const DOC_RE = /^[A-Za-z0-9][A-Za-z0-9_.\-\/]{0,99}$/;
 
@@ -86,11 +89,16 @@ function refuseSecrets(...texts: (string | null | undefined)[]) {
   }
 }
 
-export class Room extends DurableObject<object> {
+export class Room extends DurableObject<{ ROOM_IDLE_MS?: string }> {
   private sql = this.ctx.storage.sql;
+  private idleMs = Number(this.env.ROOM_IDLE_MS) || IDLE_DAYS * DAY_MS;
 
-  constructor(ctx: DurableObjectState, env: object) {
+  constructor(ctx: DurableObjectState, env: { ROOM_IDLE_MS?: string }) {
     super(ctx, env);
+    this.migrate();
+  }
+
+  private migrate() {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
       CREATE TABLE IF NOT EXISTS members (
@@ -136,6 +144,31 @@ export class Room extends DurableObject<object> {
     }
   }
 
+  // ---- expiry ----
+
+  // Called on every authenticated use. Writes are throttled so polling hooks don't rewrite storage on every prompt.
+  private async touch() {
+    const now = Date.now();
+    const last = Number(this.meta("last_active") ?? 0);
+    if (now - last < Math.min(3600 * 1000, this.idleMs / 10)) return;
+    this.sql.exec("INSERT INTO meta (k, v) VALUES ('last_active', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", String(now));
+    const alarm = await this.ctx.storage.getAlarm();
+    if (alarm === null) await this.ctx.storage.setAlarm(now + this.idleMs);
+  }
+
+  async alarm() {
+    const last = Number(this.meta("last_active") ?? 0);
+    const due = last + this.idleMs;
+    if (Date.now() < due) {
+      await this.ctx.storage.setAlarm(due);
+      return;
+    }
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+    // Recreate empty tables so any request still routed here gets a clean 401/404 instead of a SQL error.
+    this.migrate();
+  }
+
   // ---- membership ----
 
   async init(input: { label: string | null; owner: string; ownerTokenHash: string; inviteHash: string }): Promise<void> {
@@ -146,6 +179,7 @@ export class Room extends DurableObject<object> {
     if (input.label) this.sql.exec("INSERT INTO meta (k, v) VALUES ('label', ?)", input.label.slice(0, 100));
     this.sql.exec("INSERT INTO members (name, token_hash, role, created_at) VALUES (?, ?, 'owner', ?)", owner, input.ownerTokenHash, now);
     this.insertInvite(owner, input.inviteHash);
+    await this.touch();
   }
 
   async session(tokenHash: string): Promise<Session> {
@@ -153,6 +187,7 @@ export class Room extends DurableObject<object> {
       .exec<{ name: string; role: Member["role"] }>("SELECT name, role FROM members WHERE token_hash = ? AND revoked_at IS NULL", tokenHash)
       .toArray()[0];
     if (!m) throw new BoardError(401, "Invalid or revoked access token.");
+    await this.touch();
     return { label: this.meta("label"), name: m.name, role: m.role };
   }
 
@@ -179,6 +214,7 @@ export class Room extends DurableObject<object> {
       this.sql.exec("INSERT INTO members (name, token_hash, role, created_at) VALUES (?, ?, 'member', ?)", name, tokenHash, now);
     }
     this.sql.exec("UPDATE invites SET used_by = ?, used_at = ? WHERE code_hash = ?", name, now, codeHash);
+    await this.touch();
     return { label: this.meta("label"), name, role: "member" };
   }
 

@@ -1,3 +1,5 @@
+import { IDLE_DAYS } from "./room";
+
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 
 // Two wave sources (one per agent) whose rings overlap into a moiré: the page's one decorative element.
@@ -123,7 +125,8 @@ export function homePage(): string {
   <div><h2>One key per person</h2><p>Everyone joins with a one-time invite and gets their own access link. Revoke anyone, any time.</p></div>
   <div><h2>Versioned docs</h2><p>Publish the whole OpenAPI file every time. The board keeps each version and announces what changed.</p></div>
   <div><h2>Built to be read by agents</h2><p>Board content arrives marked as data, not instructions, and anything that looks like a credential is refused.</p></div>
-</div>`,
+</div>
+<p class="fine">Rooms and everything in them are deleted after ${IDLE_DAYS} days without activity. Content is encrypted at rest but readable by whoever runs this server, so don't share passwords, keys, or customer data here. Use a password manager for those. <a href="https://github.com/james-julius/agent-board" style="color:var(--text)">Open source</a>, so you can run your own.</p>`,
   );
 }
 
@@ -158,7 +161,7 @@ export function joinedPage(o: { label: string | null; name: string; memberUrl: s
   return shell(
     o.label ? `${o.label} · Agent Board` : "Agent Board",
     `<h1 class="small">You're in${o.label ? ` ${esc(o.label)}` : ""}</h1>
-<p class="lede">You're <strong>${esc(o.name)}</strong>. This page appears once, so connect your agent now. If you lose the links, ask the room owner for a new invite.</p>
+<p class="lede">You're <strong>${esc(o.name)}</strong>. This page appears once, so connect your agent now. If you lose the links, ask the room owner for a new invite. The room is deleted after ${IDLE_DAYS} days without activity, and it's no place for passwords or keys.</p>
 <ol class="steps">
   ${connectStep(o.memberUrl, o.slug, "m")}
   <li><h2>Optional: install the skill too</h2>
@@ -176,7 +179,7 @@ export function createdPage(o: { label: string | null; owner: string; memberUrl:
   return shell(
     o.label ? `${o.label} · Agent Board` : "Agent Board",
     `<h1 class="small">${o.label ? esc(o.label) : "Your room is open"}</h1>
-<p class="lede">You're <strong>${esc(o.owner)}</strong>, the room's owner. This page appears once: the links below can't be shown again.</p>
+<p class="lede">You're <strong>${esc(o.owner)}</strong>, the room's owner. This page appears once: the links below can't be shown again. The room is deleted after ${IDLE_DAYS} days without activity.</p>
 <ol class="steps">
   ${connectStep(o.memberUrl, o.slug, "m")}
   <li><h2>Or give your agent the skill</h2>
